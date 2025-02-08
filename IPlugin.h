@@ -2,16 +2,24 @@
 #ifndef IPLUGIN_H
 #define IPLUGIN_H
 
-#include "utils/db.h"
 #include <string>
+#include <fmt/os.h>
 #include <cpr/cpr.h>
 #include <fmt/format.h>
-// #include <json/json.h>
+#include <future>
 #include <fstream>
+#include <filesystem>
 #include <unordered_map>
 #include <nlohmann/json.hpp>
+#include "utils/db.h"
+#include "utils/task.h"
+#include <thread>
+#include <chrono>
+// #include "utils/progress_bar.h"
+// #include "logger.h"
 
 using namespace std;
+namespace fs = filesystem;
 using json = nlohmann::json;
 
 class IPlugin
@@ -25,37 +33,60 @@ public:
 
     virtual ~IPlugin() = default;
     virtual string getName() const = 0;
-    virtual void init() = 0;
+    virtual string getSiteId() const = 0;
+    virtual string getPluginId() const = 0;
+    virtual void init(string id) = 0;
 
-    virtual vector<unordered_map<string, string>> getIndex() = 0;
+    virtual vector<unordered_map<string, string>> getCatalog() = 0;
     virtual string getTitle() = 0;
     virtual string getAuthor() = 0;
     virtual void getCover() = 0;
 
-    void setId(string id)
-    {
-        this->id = id;
-    }
+    // void setId(string id)
+    // {
+    //     this->id = id;
+    // }
 
-    string getId()
-    {
-        return this->id;
-    }
-
-    // virtual void unload() = 0;
     virtual void unload() {};
 
+    void fetchAllChapter()
+    {
+        getCatalog();
+
+        fs::path save_path = fmt::format("{}/{}", this->novels_folder, this->title);
+        fs::create_directories(save_path);
+
+        TaskManager manager(stoi(this->max_workers), stoi(this->sleep_time));
+        auto callback = [this](const unordered_map<string, string> &chapter_data)
+        {
+            parseChapter(chapter_data);
+        };
+        for (int i = 0; i < catalog_data.size(); i++)
+        {
+            if (isDownloaded(catalog_data[i]["title"]))
+            {
+                fmt::print("Skipping chapter {} ({}/{})\n", catalog_data[i]["title"], i + 1, catalog_data.size());
+                continue;
+            }
+            manager.add_task([this, i]()
+                             { return this->fetchOneChapter(i); }, callback);
+        }
+        manager.wait_all();
+    }
+
 protected:
+    string plugin_id;
     string plugin_name;
 
     string id;
     string title;
     string site_name;
+    string site_id;
     string site_url;
     string author;
-    string index_page_text;
-    string index_page_url;
-    vector<unordered_map<string, string>> index_data;
+    string catalog_page_text;
+    string catalog_page_url;
+    vector<unordered_map<string, string>> catalog_data;
 
     // config.json
     string data_folder;
@@ -67,21 +98,57 @@ protected:
     string max_workers;
 
     DB db = DB(db_path);
+    // Logger logger = Logger("log.txt");
 
-    // virtual bool isDownloaded();
-    // virtual bool isFull();
-
-    // virtual string getIndexPage() = 0;
-    virtual string getIndexPage()
+    bool isDownloaded(string title)
     {
-        if (this->index_page_text.empty())
+        string file_path = this->novels_folder + "/" + this->title + "/" + title + ".txt";
+        ifstream file(file_path);
+        return file.is_open();
+    }
+
+    void saveChapter(string title, string content)
+    {
+        string file_path = this->novels_folder + "/" + this->title + "/" + title + ".txt";
+        auto out = fmt::output_file(file_path);
+        out.print(content);
+    }
+
+    void saveCover(string url)
+    {
+        fmt::print("Saving cover...\n");
+        cpr::Response response = cpr::Get(cpr::Url{url});
+        string content = response.text;
+        string file_path = this->covers_folder + "/" + this->title + ".png";
+        ofstream out(file_path, ofstream::binary);
+        out.write(content.c_str(), content.size());
+        out.close();
+    }
+
+    virtual string getCatalogPage()
+    {
+        if (this->catalog_page_text.empty())
         {
-            cpr::Response response = cpr::Get(cpr::Url{this->index_page_url});
-            fmt::println(response.text);
-            this->index_page_text = response.text;
+            cpr::Response response = cpr::Get(cpr::Url{this->catalog_page_url});
+            this->catalog_page_text = response.text;
         }
-        return this->index_page_text;
+        return this->catalog_page_text;
     };
+
+    virtual void parseChapter(unordered_map<string, string> chapter_data) = 0;
+
+    unordered_map<string, string> fetchOneChapter(int index)
+    {
+        fmt::print("Downloading chapter... ({}/{})\n", index + 1, this->catalog_data.size());
+        cpr::Response response = cpr::Get(cpr::Url{this->catalog_data[index]["fetch_url"]});
+        string content = response.text;
+        unordered_map<string, string> chapter_data;
+        chapter_data["status"] = "success";
+        chapter_data["index"] = to_string(index);
+        chapter_data["title"] = this->catalog_data[index]["title"];
+        chapter_data["content"] = content;
+        return chapter_data;
+    }
 
     void readConfig()
     {
@@ -94,6 +161,16 @@ protected:
         // this->db_path = data["db_path"].get<string>();
         this->sleep_time = data["sleep_time"].get<string>();
         this->max_workers = data["max_workers"].get<string>();
+
+        fs::path data_path = this->data_folder;
+        fs::path novels_path = this->novels_folder;
+        fs::path covers_path = this->covers_folder;
+        fs::path logs_path = this->logs_folder;
+
+        fs::create_directories(data_path);
+        fs::create_directories(novels_path);
+        fs::create_directories(covers_path);
+        fs::create_directories(logs_path);
     }
 };
 
